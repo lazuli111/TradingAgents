@@ -1,16 +1,19 @@
 """yfinance-based news data fetching functions."""
 
 import contextlib
+import logging
 from datetime import UTC, datetime
 
 import yfinance as yf
 from dateutil.relativedelta import relativedelta
 
 from tradingagents.dataflows.config import get_config
-from tradingagents.dataflows.date_window import coverage_gap, in_window
+from tradingagents.dataflows.date_window import coverage_gap, in_window, to_utc
 from tradingagents.dataflows.errors import VendorUnavailableError
 from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.common import yf_retry
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_article_data(article: dict) -> dict:
@@ -54,6 +57,88 @@ def _extract_article_data(article: dict) -> dict:
     }
 
 
+# Yahoo's quote pages now load ticker news from its content gateway; the
+# ``/xhr/ncp`` endpoint yfinance's ``Ticker.get_news`` calls answers 404.
+GATEWAY_URL = "https://nexus-gateway-prod.media.yahoo.com/"
+GATEWAY_LIST = "list=finance-US-en-US-ticker-news"
+# The gateway serves at most the newest 200 items of a ticker's list.
+GATEWAY_MAX_ITEMS = 200
+_GATEWAY_PAGE = 50
+_GATEWAY_QUERY = """
+query TickerNews($listInput: LightyearListInput!, $clientContext: ClientContext!, $start: Int!, $count: Int!) {
+  lightyearList(list_input: $listInput, cc: $clientContext, start: $start, count: $count) {
+    contentItems {
+      assets { ... on HydratedAsset { asset { ... on Story {
+        title
+        contentAttributes { summary publishTime canonicalUrl provider { displayName } }
+      } } } }
+      pageInfo { hasNextPage }
+    }
+  }
+}"""
+
+
+def _gateway_page(canonical: str, start: int) -> dict:
+    from curl_cffi import requests
+
+    variables = {
+        "clientContext": {"device": "desktop", "region": "US", "site": "finance", "lang": "en-US"},
+        "listInput": {"slug": GATEWAY_LIST, "queryVariables": {"tickerSymbol": [canonical]},
+                      "assetTypes": ["story"]},
+        "start": start,
+        "count": _GATEWAY_PAGE,
+    }
+    response = requests.post(
+        GATEWAY_URL,
+        json={"operationName": "TickerNews", "query": _GATEWAY_QUERY, "variables": variables},
+        headers={"x-yahoo-cg-client-name": "finance", "Origin": "https://finance.yahoo.com"},
+        impersonate="chrome", timeout=30,
+    )
+    response.raise_for_status()
+    body = response.json()
+    if body.get("errors"):
+        raise ValueError(f"content gateway errors: {body['errors'][0].get('message')}")
+    return body["data"]["lightyearList"]["contentItems"]
+
+
+def _gateway_news(canonical: str) -> list[dict]:
+    """The newest stories Yahoo lists for ``canonical``, newest first, as article data.
+
+    An unbroken newest-first stream like the old quote feed, but up to
+    GATEWAY_MAX_ITEMS deep. Raises on a failed request; an unknown symbol is empty.
+    """
+    articles: list[dict] = []
+    while len(articles) < GATEWAY_MAX_ITEMS:
+        page = _gateway_page(canonical, len(articles))
+        stories = [item["asset"] for item in page.get("assets") or []
+                   if (item or {}).get("asset") and item["asset"].get("title")]
+        for story in stories:
+            attrs = story.get("contentAttributes") or {}
+            pub_date = None
+            with contextlib.suppress(ValueError, AttributeError, TypeError):
+                pub_date = datetime.fromisoformat(attrs["publishTime"].replace("Z", "+00:00"))
+            articles.append({
+                "title": story["title"],
+                "summary": attrs.get("summary") or "",
+                "publisher": (attrs.get("provider") or {}).get("displayName") or "Unknown",
+                "link": attrs.get("canonicalUrl") or "",
+                "pub_date": pub_date,
+            })
+        if not stories or not (page.get("pageInfo") or {}).get("hasNextPage"):
+            break
+    return articles
+
+
+def _spread(articles: list[dict], limit: int) -> list[dict]:
+    """At most ``limit`` articles, picked evenly through the list so they span its time range."""
+    if len(articles) <= limit:
+        return articles
+    if limit <= 1:
+        return articles[:limit]
+    step = (len(articles) - 1) / (limit - 1)
+    return [articles[round(i * step)] for i in range(limit)]
+
+
 def _search_news(canonical: str, limit: int) -> tuple[list, bool]:
     """Yahoo search's articles tagged with ``canonical``, and whether it knows the symbol.
 
@@ -91,11 +176,12 @@ def get_news_yfinance(
 ) -> str:
     """News about ``ticker`` published in the window, from Yahoo Finance.
 
-    The symbol's quote feed comes first. When it is empty, Yahoo search serves
-    the articles tagged with the symbol; when it has none, or neither answers,
-    Yahoo news is unavailable, which is not an absence of news, and a configured
-    next vendor is tried. Search results are a sample, so finding none in the
-    window never reads as "no news".
+    The symbol's news list on Yahoo's content gateway comes first, then
+    yfinance's quote feed. When both are empty, Yahoo search serves the articles
+    tagged with the symbol; when it has none, or neither answers, Yahoo news is
+    unavailable, which is not an absence of news, and a configured next vendor
+    is tried. Search results are a sample, so finding none in the window never
+    reads as "no news".
     """
     article_limit = get_config()["news_article_limit"]
     # Query Yahoo with the canonical symbol, like every other yfinance path —
@@ -104,8 +190,17 @@ def get_news_yfinance(
     canonical = normalize_symbol(ticker)
     resolved = "" if canonical == ticker else f" (resolved to {canonical})"
     subject = f"news for {ticker}{resolved}"
-    feed = yf_retry(lambda: yf.Ticker(canonical).get_news(count=article_limit)) or []
-    articles = [_extract_article_data(a) for a in feed]
+    try:
+        articles = _gateway_news(canonical)
+    except Exception as exc:
+        logger.warning("Yahoo content gateway news failed for %s (%s); trying the quote feed",
+                       canonical, type(exc).__name__)
+        articles = []
+    feed = bool(articles)
+    if not feed:
+        quote_feed = yf_retry(lambda: yf.Ticker(canonical).get_news(count=article_limit)) or []
+        articles = [_extract_article_data(a) for a in quote_feed]
+        feed = bool(quote_feed)
     if not feed:
         found, answered = _search_news(canonical, article_limit)
         if not answered:
@@ -121,7 +216,16 @@ def get_news_yfinance(
     # Keep only articles within the requested window (look-ahead safe).
     in_range = [a for a in articles if in_window(a["pub_date"], start_dt, end_dt)]
     if in_range:
-        return f"## {ticker}{resolved} News, from {start_date} to {end_date}:\n\n{_format_articles(in_range)}"
+        picked = _spread(in_range, article_limit)
+        header = f"## {ticker}{resolved} News, from {start_date} to {end_date}:\n\n"
+        oldest = min((to_utc(a["pub_date"]) for a in articles if a["pub_date"]), default=None)
+        if feed and oldest is not None and oldest.date() > start_dt.date():
+            # A busy ticker's newest stories can all fall on the last day or two;
+            # the days before them were not observed, which is not a quiet stretch.
+            header += (f"<Partial coverage: Yahoo lists only the newest stories about {canonical}, "
+                       f"reaching back to {oldest:%Y-%m-%d %H:%M} UTC; news from {start_date} until "
+                       f"then was not retrieved, which is not an absence of {subject}>\n\n")
+        return header + _format_articles(picked)
 
     if not feed:
         return (f"<Yahoo Finance news unavailable for {start_date}..{end_date}: Yahoo search "
