@@ -16,6 +16,8 @@ PROVIDER_API_KEY_ENV: dict[str, str | None] = {
     "anthropic":  "ANTHROPIC_API_KEY",
     "google":     "GOOGLE_API_KEY",
     "azure":      "AZURE_OPENAI_API_KEY",
+    # Claude Code signs in with your Claude subscription (`claude auth login`).
+    "claude_code": None,
     # Bedrock authenticates via the AWS credential chain, not a single key env.
     "bedrock":    None,
     "xai":        "XAI_API_KEY",

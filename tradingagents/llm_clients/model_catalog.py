@@ -122,6 +122,20 @@ MODEL_OPTIONS: ProviderModeOptions = {
             ("Custom model ID", "custom"),
         ],
     },
+    # Claude Code CLI aliases, which follow the newest model of each family.
+    "claude_code": {
+        "quick": [
+            ("Sonnet - Best speed and intelligence balance", "sonnet"),
+            ("Haiku - Fastest, lightest on subscription limits", "haiku"),
+            ("Custom model ID", "custom"),
+        ],
+        "deep": [
+            ("Opus - Frontier reasoning", "opus"),
+            ("Fable - Most capable (needs Fable access on your plan)", "fable"),
+            ("Sonnet - Near-frontier at a lighter share of your limits", "sonnet"),
+            ("Custom model ID", "custom"),
+        ],
+    },
     "google": {
         "quick": [
             ("Gemini 3.8 Flash - Most capable Flash", "gemini-3.8-flash"),

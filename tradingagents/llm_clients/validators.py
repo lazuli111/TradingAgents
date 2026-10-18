@@ -8,6 +8,8 @@ from .model_catalog import get_known_models
 _ANY_MODEL_PROVIDERS = (
     "ollama", "openrouter", "openai_compatible",
     "mistral", "kimi", "groq", "nvidia", "bedrock",
+    # The Claude Code CLI takes aliases (sonnet, opus) and any full model ID.
+    "claude_code",
 )
 
 VALID_MODELS = {
